@@ -68,12 +68,12 @@ def rms_to_motor_intensities(rms_list):
         sl,              # 6: Left
         fl,              # 7: Front-Left
     ]
-    return [min(255, max(0, int(v * 255))) for v in motor_values]
+    return [min(254, max(0, int(v * 254))) for v in motor_values]
 
 
 def send_serial(ser, intensities):
     """Send sync byte + 8 motor intensity bytes over serial."""
-    packet = struct.pack("B" * 9, SYNC_BYTE, *intensities)
+    packet = struct.pack("B" * (NUM_MOTORS+1), SYNC_BYTE, *intensities)
     ser.write(packet)
 
 
