@@ -1,303 +1,25 @@
-import cv2
-import numpy as np
-import time
-import os
 import json
+import time
 import threading
-import urllib.request
 from collections import deque
-from typing import Optional, Tuple
-
 from flask import Flask, request, Response, jsonify
 
-from mediapipe.tasks.python.vision.face_landmarker import FaceLandmarker, FaceLandmarkerOptions
-from mediapipe.tasks.python.core.base_options import BaseOptions
-from mediapipe.tasks.python.vision.core.vision_task_running_mode import VisionTaskRunningMode
-from mediapipe.tasks.python.vision.core.image import Image, ImageFormat
-
-from sklearn.linear_model import Ridge
-from sklearn.preprocessing import PolynomialFeatures
-
-# ── Config ──────────────────────────────────────────────────────────────────
-CAMERA_INDEX = 0
-CAMERA_WIDTH = 640
-CAMERA_HEIGHT = 480
-PORT = 5000
+# Config
 BUFFER_SIZE = 1000
+PORT = 5000
 
-MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "face_landmarker.task")
-MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task"
-CALIBRATION_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calibration_model.json")
-
-# MediaPipe landmark indices
-LEFT_IRIS = [468, 469, 470, 471, 472]
-RIGHT_IRIS = [473, 474, 475, 476, 477]
-LEFT_EYE_CORNERS = [33, 133]
-RIGHT_EYE_CORNERS = [362, 263]
-
-# Kalman tuning
-Q_POS = 0.005
-R_MEASURE = 0.05
-
-
-# ── Model download ─────────────────────────────────────────────────────────
-def _ensure_model():
-    if not os.path.exists(MODEL_PATH):
-        print("Downloading face_landmarker.task model...")
-        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
-        print("Download complete.")
-
-
-# ── IrisTracker (MediaPipe) ────────────────────────────────────────────────
-class IrisTracker:
-    def __init__(self):
-        _ensure_model()
-        options = FaceLandmarkerOptions(
-            base_options=BaseOptions(model_asset_path=MODEL_PATH),
-            running_mode=VisionTaskRunningMode.VIDEO,
-            num_faces=1,
-            min_face_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
-        )
-        self.landmarker = FaceLandmarker.create_from_options(options)
-        self._timestamp_ms = 0
-
-    def process(self, frame: np.ndarray) -> Optional[Tuple[float, float]]:
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_image = Image(image_format=ImageFormat.SRGB, data=rgb)
-        self._timestamp_ms += 33
-        result = self.landmarker.detect_for_video(mp_image, self._timestamp_ms)
-        if not result.face_landmarks:
-            return None
-        landmarks = result.face_landmarks[0]
-        h, w = frame.shape[:2]
-        lx, ly = self._iris_ratio(landmarks, LEFT_IRIS, LEFT_EYE_CORNERS, w, h)
-        rx, ry = self._iris_ratio(landmarks, RIGHT_IRIS, RIGHT_EYE_CORNERS, w, h)
-        return (lx + rx) / 2.0, (ly + ry) / 2.0
-
-    def _iris_ratio(self, landmarks, iris_ids, corner_ids, w, h):
-        iris_center = np.mean(
-            [[landmarks[i].x * w, landmarks[i].y * h] for i in iris_ids], axis=0
-        )
-        corner_inner = np.array(
-            [landmarks[corner_ids[0]].x * w, landmarks[corner_ids[0]].y * h]
-        )
-        corner_outer = np.array(
-            [landmarks[corner_ids[1]].x * w, landmarks[corner_ids[1]].y * h]
-        )
-        eye_width = np.linalg.norm(corner_outer - corner_inner)
-        if eye_width < 1:
-            return 0.5, 0.5
-        eye_vec = corner_outer - corner_inner
-        iris_vec = iris_center - corner_inner
-        ratio_x = np.dot(iris_vec, eye_vec) / (eye_width**2)
-        eye_normal = np.array([-eye_vec[1], eye_vec[0]]) / eye_width
-        ratio_y = np.dot(iris_vec, eye_normal) / eye_width
-        return ratio_x, ratio_y
-
-
-# ── Kalman Filter (adapted from imu_kalman.py) ────────────────────────────
-class GazeKalman:
-    """Simple 1-state Kalman filter per axis for gaze smoothing."""
-
-    def __init__(self, q=Q_POS, r=R_MEASURE):
-        self.q = q
-        self.r = r
-        self.x_est = None
-        self.p_x = 1.0
-        self.y_est = None
-        self.p_y = 1.0
-
-    def update(self, mx: float, my: float) -> Tuple[float, float]:
-        if self.x_est is None:
-            self.x_est = mx
-            self.y_est = my
-            return mx, my
-
-        # Predict (state unchanged, covariance grows)
-        self.p_x += self.q
-        self.p_y += self.q
-
-        # Update X
-        k_x = self.p_x / (self.p_x + self.r)
-        self.x_est += k_x * (mx - self.x_est)
-        self.p_x *= 1.0 - k_x
-
-        # Update Y
-        k_y = self.p_y / (self.p_y + self.r)
-        self.y_est += k_y * (my - self.y_est)
-        self.p_y *= 1.0 - k_y
-
-        return self.x_est, self.y_est
-
-    def reset(self):
-        self.x_est = None
-        self.y_est = None
-        self.p_x = 1.0
-        self.p_y = 1.0
-
-
-# ── Calibration Model ─────────────────────────────────────────────────────
-class CalibrationModel:
-    def __init__(self):
-        self.samples_iris = []
-        self.samples_screen = []
-        self.poly = PolynomialFeatures(degree=2, include_bias=True)
-        self.model_x = Ridge(alpha=1.0)
-        self.model_y = Ridge(alpha=1.0)
-        self.is_trained = False
-
-    def add_sample(self, iris_x, iris_y, screen_x, screen_y):
-        self.samples_iris.append([iris_x, iris_y])
-        self.samples_screen.append([screen_x, screen_y])
-
-    def train(self):
-        X = self.poly.fit_transform(np.array(self.samples_iris))
-        Y = np.array(self.samples_screen)
-        self.model_x.fit(X, Y[:, 0])
-        self.model_y.fit(X, Y[:, 1])
-        self.is_trained = True
-
-    def predict(self, iris_x, iris_y) -> Tuple[float, float]:
-        X = self.poly.transform(np.array([[iris_x, iris_y]]))
-        sx = float(self.model_x.predict(X)[0])
-        sy = float(self.model_y.predict(X)[0])
-        return sx, sy
-
-    def clear(self):
-        self.samples_iris.clear()
-        self.samples_screen.clear()
-        self.is_trained = False
-
-    def save(self, path):
-        data = {
-            "samples_iris": self.samples_iris,
-            "samples_screen": self.samples_screen,
-            "coef_x": self.model_x.coef_.tolist(),
-            "intercept_x": float(self.model_x.intercept_),
-            "coef_y": self.model_y.coef_.tolist(),
-            "intercept_y": float(self.model_y.intercept_),
-        }
-        with open(path, "w") as f:
-            json.dump(data, f)
-
-    def load(self, path):
-        with open(path, "r") as f:
-            data = json.load(f)
-        self.samples_iris = data["samples_iris"]
-        self.samples_screen = data["samples_screen"]
-        # Retrain from saved samples to restore poly + models properly
-        if len(self.samples_iris) >= 9:
-            self.train()
-            return True
-        return False
-
-
-# ── Shared State ───────────────────────────────────────────────────────────
+# Shared state
 gaze_lock = threading.Lock()
-latest_gaze = {"x": 0.5, "y": 0.5, "tracking": False, "ts": 0}
+latest_gaze = {"x": 0, "y": 0, "tracking": False, "ts": 0}
 gaze_buffer = deque(maxlen=BUFFER_SIZE)
 
-iris_lock = threading.Lock()
-iris_buffer = deque(maxlen=10)
-
-frame_lock = threading.Lock()
-latest_frame = None  # JPEG bytes
-
-calibration = CalibrationModel()
-kalman = GazeKalman()
-
-
-# ── Camera Thread ──────────────────────────────────────────────────────────
-def camera_thread():
-    global latest_gaze, latest_frame
-
-    cap = cv2.VideoCapture(CAMERA_INDEX)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-    cap.set(cv2.CAP_PROP_FPS, 30)
-
-    if not cap.isOpened():
-        print("[ERROR] Could not open camera at index", CAMERA_INDEX)
-        return
-    print(
-        f"[OK] Camera opened: {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}"
-    )
-
-    tracker = IrisTracker()
-    print("[OK] Face landmarker model loaded")
-
-    face_lost_frames = 0
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            time.sleep(0.01)
-            continue
-        frame = cv2.flip(frame, 1)
-
-        # Encode JPEG for MJPEG stream
-        _, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-        with frame_lock:
-            latest_frame = jpeg.tobytes()
-
-        # Iris detection
-        result = tracker.process(frame)
-
-        if result is None:
-            face_lost_frames += 1
-            if face_lost_frames > 30:
-                with gaze_lock:
-                    latest_gaze = {**latest_gaze, "tracking": False}
-            continue
-
-        face_lost_frames = 0
-        iris_x, iris_y = result
-
-        # Store iris data for calibration
-        with iris_lock:
-            iris_buffer.append((iris_x, iris_y, time.time()))
-
-        # If calibrated, predict screen coordinates
-        if calibration.is_trained:
-            sx, sy = calibration.predict(iris_x, iris_y)
-            sx = max(0.0, min(1.0, sx))
-            sy = max(0.0, min(1.0, sy))
-            sx, sy = kalman.update(sx, sy)
-
-            entry = {
-                "x": round(float(sx), 5),
-                "y": round(float(sy), 5),
-                "tracking": True,
-                "ts": round(time.time() * 1000),
-            }
-            with gaze_lock:
-                latest_gaze = entry
-                gaze_buffer.append(entry)
-
-
-# ── MJPEG Stream ───────────────────────────────────────────────────────────
-def generate_frames():
-    while True:
-        with frame_lock:
-            frame = latest_frame
-        if frame is None:
-            time.sleep(0.03)
-            continue
-        yield (
-            b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
-        )
-        time.sleep(0.033)
-
-
-# ── Flask App ──────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
 HTML_PAGE = r"""<!DOCTYPE html>
 <html>
 <head>
 <title>GameSense Eye Tracker</title>
-<script src="https://cdn.jsdelivr.net/npm/webgazer@2.1.3/dist/webgazer.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/webgazer@2.1.2/dist/webgazer.min.js"></script>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
@@ -308,46 +30,46 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .screen { display: none; width: 100%; height: 100%; position: absolute; top: 0; left: 0; }
   .screen.active { display: flex; flex-direction: column; align-items: center; justify-content: center; }
 
-  /* Setup */
-  #setup-screen .cam-preview {
-    border-radius: 12px; border: 2px solid #333; margin-bottom: 20px;
+  /* Screen 1: Setup */
+  #setup-screen .instructions {
+    text-align: center; margin-top: 20px; max-width: 500px;
   }
-  #setup-screen .instructions { text-align: center; max-width: 500px; }
-  #setup-screen h1 { color: #e0e0e0; font-size: 28px; margin-bottom: 12px; }
-  #setup-screen p { color: #999; font-size: 15px; line-height: 1.5; margin-bottom: 10px; }
-  .face-status {
-    font-size: 18px; font-weight: 600; margin: 16px 0;
-    padding: 10px 24px; border-radius: 8px; display: inline-block;
+  #setup-screen .instructions h1 { color: #e0e0e0; font-size: 28px; margin-bottom: 16px; }
+  #setup-screen .instructions p { color: #999; font-size: 16px; line-height: 1.6; margin-bottom: 12px; }
+  #setup-screen .face-status {
+    font-size: 18px; font-weight: 600; margin: 20px 0;
+    padding: 10px 24px; border-radius: 8px;
   }
   .face-ok { background: #00ff8822; color: #00ff88; border: 1px solid #00ff8844; }
   .face-bad { background: #ff444422; color: #ff4444; border: 1px solid #ff444444; }
-  .btn-primary {
-    padding: 14px 40px; font-size: 18px; background: #00cc66; color: #111;
-    border: none; border-radius: 8px; cursor: pointer; font-weight: 600;
-    transition: all 0.2s; margin: 6px;
+  #begin-calibration {
+    margin-top: 20px; padding: 14px 40px; font-size: 18px;
+    background: #00cc66; color: #111; border: none; border-radius: 8px;
+    cursor: pointer; font-weight: 600; transition: all 0.2s;
   }
-  .btn-primary:disabled { opacity: 0.3; cursor: not-allowed; }
-  .btn-primary:not(:disabled):hover { background: #00ff88; transform: scale(1.05); }
-  .btn-secondary {
-    padding: 10px 30px; font-size: 14px; background: transparent; color: #888;
-    border: 1px solid #444; border-radius: 8px; cursor: pointer;
-    transition: all 0.2s; margin: 6px;
+  #begin-calibration:disabled { opacity: 0.3; cursor: not-allowed; }
+  #begin-calibration:not(:disabled):hover { background: #00ff88; transform: scale(1.05); }
+  #use-previous {
+    margin-top: 12px; padding: 10px 30px; font-size: 14px;
+    background: transparent; color: #888; border: 1px solid #444; border-radius: 8px;
+    cursor: pointer; transition: all 0.2s; display: none;
   }
-  .btn-secondary:hover { border-color: #888; color: #ccc; }
+  #use-previous:hover { border-color: #888; color: #ccc; }
 
-  /* Calibration */
+  /* Screen 2: Calibration */
   #calibration-screen { cursor: crosshair; }
-  .cal-header {
+  #calibration-screen .cal-header {
     position: fixed; top: 20px; left: 50%; transform: translateX(-50%);
     text-align: center; z-index: 100; pointer-events: none;
   }
-  .cal-header h2 { color: #e0e0e0; font-size: 22px; }
-  .cal-header p { color: #888; font-size: 14px; margin-top: 6px; }
+  #calibration-screen .cal-header h2 { color: #e0e0e0; font-size: 22px; }
+  #calibration-screen .cal-header p { color: #888; font-size: 14px; margin-top: 6px; }
   .cal-point {
     position: absolute; width: 40px; height: 40px; border-radius: 50%;
     transform: translate(-50%, -50%); cursor: pointer; z-index: 50;
     display: flex; align-items: center; justify-content: center;
-    font-size: 11px; font-weight: 700; color: #fff; transition: all 0.3s;
+    font-size: 11px; font-weight: 700; color: #fff;
+    transition: all 0.3s;
   }
   .cal-point.waiting { background: #ffffff22; border: 2px solid #ffffff44; }
   .cal-point.active {
@@ -365,27 +87,39 @@ HTML_PAGE = r"""<!DOCTYPE html>
     font-size: 16px; color: #888; z-index: 100; pointer-events: none;
   }
 
-  /* Validation */
+  /* Screen 3: Validation */
+  #validation-screen .val-content { text-align: center; }
+  #validation-screen h2 { color: #e0e0e0; font-size: 24px; margin-bottom: 16px; }
+  #validation-screen p { color: #999; font-size: 16px; margin-bottom: 8px; }
   .val-point {
     position: absolute; width: 20px; height: 20px; border-radius: 50%;
     background: #00aaff; border: 2px solid #44ccff;
     box-shadow: 0 0 15px #00aaff66;
-    transform: translate(-50%, -50%); display: none; z-index: 50;
+    transform: translate(-50%, -50%); display: none;
   }
-  #accuracy-result { font-size: 48px; font-weight: 700; margin: 20px 0; }
+  #accuracy-result {
+    font-size: 48px; font-weight: 700; margin: 20px 0;
+  }
   .accuracy-excellent { color: #00ff88; }
   .accuracy-good { color: #ffaa00; }
   .accuracy-poor { color: #ff4444; }
+  .val-btn {
+    padding: 12px 32px; font-size: 16px; border: none; border-radius: 8px;
+    cursor: pointer; font-weight: 600; margin: 8px; transition: all 0.2s;
+  }
+  .val-btn:hover { transform: scale(1.05); }
+  #btn-recalibrate { background: #444; color: #ccc; }
+  #btn-start-tracking { background: #00cc66; color: #111; }
 
-  /* Tracking */
-  #tracking-screen { cursor: default; }
+  /* Screen 4: Tracking */
+  #tracking-screen { cursor: none; }
   #gaze-dot {
     position: absolute; width: 30px; height: 30px;
     background: radial-gradient(circle, #00ff88, #00cc66);
     border-radius: 50%; transform: translate(-50%, -50%);
     box-shadow: 0 0 20px #00ff88, 0 0 40px #00ff8844;
     pointer-events: none; z-index: 100;
-    transition: left 0.08s linear, top 0.08s linear;
+    transition: left 0.05s linear, top 0.05s linear;
   }
   #trail-canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
   #crosshair-h, #crosshair-v { position: absolute; background: #ffffff11; }
@@ -395,35 +129,58 @@ HTML_PAGE = r"""<!DOCTYPE html>
     position: fixed; top: 20px; left: 20px; color: #888;
     font-family: monospace; font-size: 14px; z-index: 200; pointer-events: none;
   }
-  .top-right-btn {
+  #btn-recal-tracking {
     position: fixed; top: 20px; right: 20px; z-index: 200;
-    padding: 8px 20px; font-size: 13px; background: #333; color: #aaa;
-    border: 1px solid #555; border-radius: 6px; cursor: pointer;
+    padding: 8px 20px; font-size: 13px;
+    background: #333; color: #aaa; border: 1px solid #555; border-radius: 6px;
+    cursor: pointer; transition: all 0.2s;
   }
-  .top-right-btn:hover { background: #444; color: #fff; }
-  #bg-message {
-    position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
-    background: #00ff8822; color: #00ff88; padding: 10px 24px; border-radius: 8px;
-    font-size: 14px; z-index: 200; pointer-events: none; border: 1px solid #00ff8844;
+  #btn-recal-tracking:hover { background: #444; color: #fff; cursor: default; }
+
+  /* WebGazer video overlay adjustments */
+  #webgazerVideoFeed { display: none !important; }
+  #webgazerFaceFeedbackBox { display: none !important; }
+  #webgazerVideoCanvas { display: none !important; }
+  #webgazerFaceOverlay { display: none !important; }
+  .setup-active #webgazerVideoFeed {
+    display: block !important; position: fixed !important;
+    top: 40px !important; left: 50% !important;
+    transform: translateX(-50%) !important;
+    width: 320px !important; height: 240px !important;
+    border-radius: 12px !important; border: 2px solid #333 !important;
+    z-index: 10 !important;
+  }
+  .setup-active #webgazerFaceFeedbackBox {
+    display: block !important; border-width: 3px !important;
+    z-index: 11 !important;
+  }
+  .setup-active #webgazerFaceOverlay {
+    display: block !important; z-index: 11 !important;
+  }
+  .setup-active #webgazerVideoCanvas {
+    display: block !important; z-index: 11 !important;
+  }
+  .tracking-active #webgazerVideoFeed {
+    display: block !important; position: fixed !important;
+    bottom: 10px !important; right: 10px !important;
+    left: auto !important; top: auto !important; transform: none !important;
+    width: 160px !important; height: 120px !important;
+    border-radius: 8px !important; border: 1px solid #333 !important;
+    opacity: 0.6 !important; z-index: 200 !important;
   }
 </style>
 </head>
 <body>
 
-<!-- Screen 1: Setup -->
+<!-- Screen 1: Face Setup -->
 <div id="setup-screen" class="screen active">
-  <img id="cam-preview" class="cam-preview" src="/video_feed" width="480" height="360" alt="Camera">
-  <div class="instructions">
+  <div class="instructions" style="margin-top: 300px;">
     <h1>GameSense Eye Tracker</h1>
-    <p>Position your face in the camera frame above.<br>
-       Keep a comfortable distance from the screen.</p>
-    <div id="face-status" class="face-status face-bad">Waiting for face...</div>
-    <div>
-      <button id="btn-begin-cal" class="btn-primary" disabled>Begin Calibration</button>
-    </div>
-    <div>
-      <button id="btn-use-prev" class="btn-secondary" style="display:none">Use Previous Calibration</button>
-    </div>
+    <p>This tool tracks your eye movements using your webcam.<br>
+       Allow camera access when prompted, then position your face in the frame above.</p>
+    <div id="face-status" class="face-status face-bad">Initializing camera...</div>
+    <button id="begin-calibration" disabled>Begin Calibration</button>
+    <button id="use-previous">Use Previous Calibration</button>
   </div>
 </div>
 
@@ -431,7 +188,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <div id="calibration-screen" class="screen">
   <div class="cal-header">
     <h2>Calibration</h2>
-    <p>Look at the orange dot and click it 5 times</p>
+    <p>Click each orange point 5 times while looking at it</p>
   </div>
   <div id="cal-points-container"></div>
   <div id="cal-progress">0 / 9 points complete</div>
@@ -440,13 +197,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <!-- Screen 3: Validation -->
 <div id="validation-screen" class="screen">
   <div class="val-point" id="val-point"></div>
-  <div id="val-results" style="text-align:center; display:none;">
-    <h2 style="color:#e0e0e0; font-size:24px;">Calibration Quality</h2>
+  <div class="val-content" id="val-content" style="display:none;">
+    <h2>Calibration Quality</h2>
     <div id="accuracy-result"></div>
-    <p id="accuracy-desc" style="color:#999; font-size:16px;"></p>
-    <div style="margin-top:20px;">
-      <button class="btn-secondary" id="btn-recal-val">Recalibrate</button>
-      <button class="btn-primary" id="btn-start-tracking">Start Tracking</button>
+    <p id="accuracy-desc"></p>
+    <div style="margin-top: 20px;">
+      <button class="val-btn" id="btn-recalibrate">Recalibrate</button>
+      <button class="val-btn" id="btn-start-tracking">Start Tracking</button>
     </div>
   </div>
   <div id="val-status" style="text-align:center; display:none;">
@@ -463,50 +220,103 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <canvas id="trail-canvas"></canvas>
   <div id="gaze-dot"></div>
   <div id="tracking-status">Waiting for gaze...</div>
-  <button class="top-right-btn" id="btn-recal-tracking">Recalibrate</button>
-  <div id="bg-message">Tracking runs in background. You can minimize or close this tab.</div>
+  <button id="btn-recal-tracking">Recalibrate</button>
 </div>
 
 <script>
 (function() {
+  // ---- State ----
+  let faceDetected = false;
   let currentScreen = 'setup';
 
+  // ---- Screen management ----
   function showScreen(name) {
     currentScreen = name;
     document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
     document.getElementById(name + '-screen').classList.add('active');
+    document.body.className = '';
+    if (name === 'setup') document.body.classList.add('setup-active');
+    if (name === 'tracking') document.body.classList.add('tracking-active');
   }
 
-  // ── Setup screen ──
-  let faceCheckInterval = setInterval(() => {
-    fetch('/status').then(r => r.json()).then(d => {
-      const el = document.getElementById('face-status');
-      const btn = document.getElementById('btn-begin-cal');
-      if (d.face_detected) {
-        el.textContent = 'Face detected - ready!';
-        el.className = 'face-status face-ok';
+  // ---- WebGazer initialization ----
+  async function initWebGazer() {
+    webgazer.params.showVideoPreview = true;
+    webgazer
+      .setRegression('ridge')
+      .applyKalmanFilter(true)
+      .showVideoPreview(true)
+      .showPredictionPoints(false)
+      .showFaceOverlay(true)
+      .showFaceFeedbackBox(true);
+
+    await webgazer.begin();
+    webgazer.showVideoPreview(true);
+    webgazer.showFaceFeedbackBox(true);
+    webgazer.showFaceOverlay(true);
+
+    // Poll for face detection
+    setInterval(checkFace, 500);
+
+    // Check for previous calibration data
+    checkPreviousCalibration();
+  }
+
+  function checkFace() {
+    const prediction = webgazer.getCurrentPrediction();
+    const statusEl = document.getElementById('face-status');
+    const btn = document.getElementById('begin-calibration');
+    if (prediction && prediction.x !== null && prediction.y !== null) {
+      if (!faceDetected) {
+        faceDetected = true;
+        statusEl.textContent = 'Face detected - ready!';
+        statusEl.className = 'face-status face-ok';
         btn.disabled = false;
-      } else {
-        el.textContent = 'No face detected - adjust position';
-        el.className = 'face-status face-bad';
+      }
+    } else {
+      if (faceDetected || statusEl.textContent === 'Initializing camera...') {
+        faceDetected = false;
+        statusEl.textContent = 'No face detected - adjust position';
+        statusEl.className = 'face-status face-bad';
         if (currentScreen === 'setup') btn.disabled = true;
       }
-      if (d.calibrated) {
-        document.getElementById('btn-use-prev').style.display = 'inline-block';
-      }
-    }).catch(() => {});
-  }, 500);
+    }
+  }
 
-  // ── Calibration ──
+  function checkPreviousCalibration() {
+    // WebGazer stores data in localforage/IndexedDB. If data exists, offer reuse.
+    if (window.localforage) {
+      localforage.getItem('webgazerGlobalData').then(data => {
+        if (data) {
+          document.getElementById('use-previous').style.display = 'inline-block';
+        }
+      }).catch(() => {});
+    } else {
+      // Try checking after a delay for localforage to load
+      setTimeout(() => {
+        if (window.localforage) {
+          localforage.getItem('webgazerGlobalData').then(data => {
+            if (data) {
+              document.getElementById('use-previous').style.display = 'inline-block';
+            }
+          }).catch(() => {});
+        }
+      }, 2000);
+    }
+  }
+
+  // ---- Calibration ----
   const CAL_POSITIONS = [
-    [10,10],[50,10],[90,10],
-    [10,50],[50,50],[90,50],
-    [10,90],[50,90],[90,90]
+    [10, 10], [50, 10], [90, 10],
+    [10, 50], [50, 50], [90, 50],
+    [10, 90], [50, 90], [90, 90]
   ];
   const CLICKS_PER_POINT = 5;
-  let calOrder = [], calIndex = 0, calClicks = {};
+  let calOrder = [];
+  let calIndex = 0;
+  let calClicks = {};
 
-  function shuffle(arr) {
+  function shuffleArray(arr) {
     const a = arr.slice();
     for (let i = a.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
@@ -516,11 +326,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
 
   function startCalibration() {
-    // Reset server calibration state
-    fetch('/calibrate_reset', { method: 'POST' });
+    // Pause gaze listener during calibration so only clicks train the model
+    webgazer.clearGazeListener();
     showScreen('calibration');
 
-    calOrder = shuffle([0,1,2,3,4,5,6,7,8]);
+    calOrder = shuffleArray([0, 1, 2, 3, 4, 5, 6, 7, 8]);
     calIndex = 0;
     calClicks = {};
     for (let i = 0; i < 9; i++) calClicks[i] = 0;
@@ -538,6 +348,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       pt.addEventListener('click', () => onCalClick(i));
       container.appendChild(pt);
     });
+
     highlightCalPoint();
   }
 
@@ -546,28 +357,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
       if (!p.classList.contains('done')) p.className = 'cal-point waiting';
     });
     if (calIndex < 9) {
-      document.getElementById('cal-pt-' + calOrder[calIndex]).className = 'cal-point active';
+      const idx = calOrder[calIndex];
+      document.getElementById('cal-pt-' + idx).className = 'cal-point active';
     }
-    const done = Object.values(calClicks).filter(c => c >= CLICKS_PER_POINT).length;
-    document.getElementById('cal-progress').textContent = done + ' / 9 points complete';
+    updateCalProgress();
   }
 
-  function onCalClick(idx) {
-    if (calOrder[calIndex] !== idx) return;
+  function onCalClick(pointIndex) {
+    if (calOrder[calIndex] !== pointIndex) return; // only accept clicks on active point
 
-    const pos = CAL_POSITIONS[idx];
-    // Send calibration point to server
-    fetch('/calibrate_point', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ screen_x: pos[0] / 100, screen_y: pos[1] / 100 })
-    });
+    calClicks[pointIndex]++;
+    const pt = document.getElementById('cal-pt-' + pointIndex);
+    pt.textContent = calClicks[pointIndex] + '/' + CLICKS_PER_POINT;
 
-    calClicks[idx]++;
-    const pt = document.getElementById('cal-pt-' + idx);
-    pt.textContent = calClicks[idx] + '/' + CLICKS_PER_POINT;
-
-    if (calClicks[idx] >= CLICKS_PER_POINT) {
+    if (calClicks[pointIndex] >= CLICKS_PER_POINT) {
       pt.className = 'cal-point done';
       pt.textContent = '\u2713';
       calIndex++;
@@ -575,35 +378,46 @@ HTML_PAGE = r"""<!DOCTYPE html>
         finishCalibration();
         return;
       }
+      highlightCalPoint();
     }
-    highlightCalPoint();
+  }
+
+  function updateCalProgress() {
+    const done = Object.values(calClicks).filter(c => c >= CLICKS_PER_POINT).length;
+    document.getElementById('cal-progress').textContent = done + ' / 9 points complete';
   }
 
   function finishCalibration() {
-    document.getElementById('cal-progress').textContent = 'Training model...';
-    fetch('/calibrate_finish', { method: 'POST' })
-      .then(r => r.json())
-      .then(d => {
-        if (d.ok) startValidation();
-        else alert('Calibration error: ' + (d.error || 'unknown'));
-      });
+    // Brief pause to let regression stabilize
+    document.getElementById('cal-progress').textContent = 'Processing...';
+    setTimeout(() => {
+      startValidation();
+    }, 600);
   }
 
-  // ── Validation ──
-  const VAL_POSITIONS = [[30,30],[70,30],[50,50],[30,70],[70,70]];
-  let valIndex = 0, valErrors = [];
+  // ---- Validation ----
+  const VAL_POSITIONS = [
+    [30, 30], [70, 30], [50, 50], [30, 70], [70, 70]
+  ];
+  let valIndex = 0;
+  let valErrors = [];
+  let valSamples = [];
+  let valTimer = null;
 
   function startValidation() {
     showScreen('validation');
-    document.getElementById('val-results').style.display = 'none';
+    document.getElementById('val-content').style.display = 'none';
     document.getElementById('val-status').style.display = 'block';
     valIndex = 0;
     valErrors = [];
-    setTimeout(showValPoint, 500);
+    showValPoint();
   }
 
   function showValPoint() {
-    if (valIndex >= VAL_POSITIONS.length) { finishValidation(); return; }
+    if (valIndex >= VAL_POSITIONS.length) {
+      finishValidation();
+      return;
+    }
 
     document.getElementById('val-progress-text').textContent =
       'Point ' + (valIndex + 1) + ' / ' + VAL_POSITIONS.length;
@@ -614,29 +428,28 @@ HTML_PAGE = r"""<!DOCTYPE html>
     pt.style.top = pos[1] + 'vh';
     pt.style.display = 'block';
 
-    const targetX = pos[0] / 100;
-    const targetY = pos[1] / 100;
-    let samples = [];
-    let collectCount = 0;
+    const targetX = pos[0] / 100 * window.innerWidth;
+    const targetY = pos[1] / 100 * window.innerHeight;
 
-    const interval = setInterval(() => {
-      fetch('/gaze').then(r => r.json()).then(d => {
-        if (d.tracking) {
-          // Normalize pixel coords to 0-1 for comparison
-          samples.push({ x: d.x, y: d.y });
-        }
-        collectCount++;
-      }).catch(() => {});
-    }, 50);
+    valSamples = [];
+    let sampleCount = 0;
+
+    // Collect samples for 2 seconds
+    webgazer.setGazeListener((data, timestamp) => {
+      if (data && sampleCount < 50) {
+        valSamples.push({ x: data.x, y: data.y });
+        sampleCount++;
+      }
+    });
 
     setTimeout(() => {
-      clearInterval(interval);
+      webgazer.clearGazeListener();
       pt.style.display = 'none';
 
-      if (samples.length > 3) {
-        const avgX = samples.reduce((s, p) => s + p.x, 0) / samples.length;
-        const avgY = samples.reduce((s, p) => s + p.y, 0) / samples.length;
-        const error = Math.sqrt((avgX - targetX) ** 2 + (avgY - targetY) ** 2);
+      if (valSamples.length > 5) {
+        const avgX = valSamples.reduce((s, p) => s + p.x, 0) / valSamples.length;
+        const avgY = valSamples.reduce((s, p) => s + p.y, 0) / valSamples.length;
+        const error = Math.sqrt(Math.pow(avgX - targetX, 2) + Math.pow(avgY - targetY, 2));
         valErrors.push(error);
       }
 
@@ -647,195 +460,251 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
   function finishValidation() {
     document.getElementById('val-status').style.display = 'none';
-    document.getElementById('val-results').style.display = 'block';
+    document.getElementById('val-content').style.display = 'block';
 
     const avgError = valErrors.length > 0
-      ? valErrors.reduce((a, b) => a + b, 0) / valErrors.length : 1;
+      ? valErrors.reduce((a, b) => a + b, 0) / valErrors.length
+      : 999;
 
-    // Error is in normalized coords (0-1). Convert to accuracy %.
-    // ~0.05 error = excellent, ~0.15 = poor
-    const accuracy = Math.max(0, Math.round(100 - avgError * 500));
+    // Convert pixel error to a percentage of screen diagonal
+    const diag = Math.sqrt(window.innerWidth ** 2 + window.innerHeight ** 2);
+    const errorPct = (avgError / diag) * 100;
+    const accuracy = Math.max(0, Math.round(100 - errorPct * 3));
 
-    const resEl = document.getElementById('accuracy-result');
+    const resultEl = document.getElementById('accuracy-result');
     const descEl = document.getElementById('accuracy-desc');
-    resEl.textContent = accuracy + '%';
 
-    if (accuracy >= 75) {
-      resEl.className = 'accuracy-excellent';
-      descEl.textContent = 'Excellent! Ready for tracking.';
-    } else if (accuracy >= 45) {
-      resEl.className = 'accuracy-good';
+    resultEl.textContent = accuracy + '%';
+    if (accuracy >= 80) {
+      resultEl.className = 'accuracy-excellent';
+      descEl.textContent = 'Excellent accuracy! Ready for tracking.';
+    } else if (accuracy >= 50) {
+      resultEl.className = 'accuracy-good';
       descEl.textContent = 'Good accuracy. Recalibration may improve results.';
     } else {
-      resEl.className = 'accuracy-poor';
-      descEl.textContent = 'Low accuracy. Try recalibrating with better lighting.';
+      resultEl.className = 'accuracy-poor';
+      descEl.textContent = 'Low accuracy. Consider recalibrating with better lighting.';
     }
+
+    // Report to server
+    fetch('/calibration_status', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ accuracy: accuracy, avgErrorPx: Math.round(avgError) })
+    }).catch(() => {});
   }
 
-  // ── Tracking ──
-  let trailCtx = null, prevX = null, prevY = null;
+  // ---- Tracking ----
+  let emaX = null, emaY = null;
+  const EMA_ALPHA = 0.3;
+  let latestGaze = null;
+  let lastFaceTime = 0;
+  let trailCtx = null;
+  let prevTrailX = null, prevTrailY = null;
 
   function startTracking() {
     showScreen('tracking');
+
     const canvas = document.getElementById('trail-canvas');
     canvas.width = window.innerWidth;
     canvas.height = window.innerHeight;
     trailCtx = canvas.getContext('2d');
-    prevX = null; prevY = null;
+    prevTrailX = null;
+    prevTrailY = null;
+    emaX = null;
+    emaY = null;
 
     window.addEventListener('resize', () => {
       canvas.width = window.innerWidth;
       canvas.height = window.innerHeight;
     });
 
-    pollGaze();
+    webgazer.showVideoPreview(true);
+    webgazer.showFaceFeedbackBox(false);
+    webgazer.showFaceOverlay(false);
+    webgazer.showPredictionPoints(false);
+
+    webgazer.setGazeListener((data, timestamp) => {
+      if (data) {
+        latestGaze = { x: data.x, y: data.y, ts: Date.now() };
+        lastFaceTime = Date.now();
+      }
+    });
+
+    // Render loop
+    requestAnimationFrame(renderTracking);
+
+    // Data send loop at 20 Hz
+    setInterval(sendGazeToServer, 50);
   }
 
-  function pollGaze() {
+  function renderTracking() {
     if (currentScreen !== 'tracking') return;
 
-    fetch('/gaze').then(r => r.json()).then(d => {
-      const dot = document.getElementById('gaze-dot');
-      const status = document.getElementById('tracking-status');
+    const dot = document.getElementById('gaze-dot');
+    const status = document.getElementById('tracking-status');
+    const now = Date.now();
 
-      if (d.tracking) {
-        const px = d.x * window.innerWidth;
-        const py = d.y * window.innerHeight;
-        dot.style.left = px + 'px';
-        dot.style.top = py + 'px';
-        dot.style.opacity = '1';
-        status.textContent = 'x: ' + d.x.toFixed(4) + '  y: ' + d.y.toFixed(4);
-        status.style.color = '#00ff88';
-
-        if (trailCtx && prevX !== null) {
-          trailCtx.strokeStyle = 'rgba(0,255,136,0.15)';
-          trailCtx.lineWidth = 2;
-          trailCtx.beginPath();
-          trailCtx.moveTo(prevX, prevY);
-          trailCtx.lineTo(px, py);
-          trailCtx.stroke();
-        }
-        if (trailCtx) {
-          trailCtx.fillStyle = 'rgba(26,26,46,0.02)';
-          trailCtx.fillRect(0, 0, trailCtx.canvas.width, trailCtx.canvas.height);
-        }
-        prevX = px; prevY = py;
+    if (latestGaze && (now - latestGaze.ts) < 2000) {
+      // EMA smoothing for display only
+      if (emaX === null) {
+        emaX = latestGaze.x;
+        emaY = latestGaze.y;
       } else {
+        emaX = EMA_ALPHA * latestGaze.x + (1 - EMA_ALPHA) * emaX;
+        emaY = EMA_ALPHA * latestGaze.y + (1 - EMA_ALPHA) * emaY;
+      }
+
+      // Clamp to viewport
+      const px = Math.max(0, Math.min(window.innerWidth, emaX));
+      const py = Math.max(0, Math.min(window.innerHeight, emaY));
+
+      dot.style.left = px + 'px';
+      dot.style.top = py + 'px';
+      dot.style.opacity = '1';
+
+      const normX = (px / window.innerWidth).toFixed(4);
+      const normY = (py / window.innerHeight).toFixed(4);
+      status.textContent = 'x: ' + normX + '  y: ' + normY;
+      status.style.color = '#00ff88';
+
+      // Trail
+      if (trailCtx && prevTrailX !== null) {
+        trailCtx.strokeStyle = 'rgba(0,255,136,0.15)';
+        trailCtx.lineWidth = 2;
+        trailCtx.beginPath();
+        trailCtx.moveTo(prevTrailX, prevTrailY);
+        trailCtx.lineTo(px, py);
+        trailCtx.stroke();
+      }
+      trailCtx.fillStyle = 'rgba(26,26,46,0.02)';
+      trailCtx.fillRect(0, 0, trailCtx.canvas.width, trailCtx.canvas.height);
+      prevTrailX = px;
+      prevTrailY = py;
+    } else {
+      // Face lost
+      if (now - lastFaceTime > 1000) {
         status.textContent = 'Face not detected';
         status.style.color = '#ff4444';
         dot.style.opacity = '0.3';
-        prevX = null; prevY = null;
+        prevTrailX = null;
+        prevTrailY = null;
       }
+    }
 
-      requestAnimationFrame(pollGaze);
-    }).catch(() => setTimeout(pollGaze, 100));
+    requestAnimationFrame(renderTracking);
   }
 
-  // ── Button wiring ──
-  document.getElementById('btn-begin-cal').addEventListener('click', startCalibration);
-  document.getElementById('btn-use-prev').addEventListener('click', startTracking);
-  document.getElementById('btn-recal-val').addEventListener('click', startCalibration);
-  document.getElementById('btn-start-tracking').addEventListener('click', startTracking);
-  document.getElementById('btn-recal-tracking').addEventListener('click', startCalibration);
+  function sendGazeToServer() {
+    if (!latestGaze || currentScreen !== 'tracking') return;
+    fetch('/gaze', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        x: latestGaze.x,
+        y: latestGaze.y,
+        screen_width: window.innerWidth,
+        screen_height: window.innerHeight,
+        ts: latestGaze.ts
+      })
+    }).catch(() => {});
+  }
+
+  function recalibrate() {
+    webgazer.clearGazeListener();
+    latestGaze = null;
+    emaX = null;
+    emaY = null;
+    webgazer.clearData();
+    startCalibration();
+  }
+
+  // ---- Event listeners ----
+  document.getElementById('begin-calibration').addEventListener('click', () => {
+    startCalibration();
+  });
+
+  document.getElementById('use-previous').addEventListener('click', () => {
+    startTracking();
+  });
+
+  document.getElementById('btn-recalibrate').addEventListener('click', () => {
+    recalibrate();
+  });
+
+  document.getElementById('btn-start-tracking').addEventListener('click', () => {
+    startTracking();
+  });
+
+  document.getElementById('btn-recal-tracking').addEventListener('click', () => {
+    recalibrate();
+  });
+
+  // ---- Init ----
+  initWebGazer().catch(err => {
+    console.error('WebGazer init failed:', err);
+    document.getElementById('face-status').textContent = 'Camera error: ' + err.message;
+  });
 })();
 </script>
 </body>
 </html>"""
 
 
-@app.route("/")
+@app.route('/')
 def index():
     return HTML_PAGE
 
 
-@app.route("/video_feed")
-def video_feed():
-    return Response(
-        generate_frames(), mimetype="multipart/x-mixed-replace; boundary=frame"
-    )
-
-
-@app.route("/status")
-def status():
-    with iris_lock:
-        recent = list(iris_buffer)
-    face_detected = len(recent) > 0 and (time.time() - recent[-1][2]) < 1.0 if recent else False
-    return jsonify({
-        "face_detected": face_detected,
-        "calibrated": calibration.is_trained,
-        "sample_count": len(calibration.samples_iris),
-    })
-
-
-@app.route("/calibrate_point", methods=["POST"])
-def calibrate_point():
-    data = request.get_json(silent=True)
-    if not data:
-        return jsonify({"error": "no data"}), 400
-
-    screen_x = float(data["screen_x"])
-    screen_y = float(data["screen_y"])
-
-    # Average recent iris readings for stability
-    with iris_lock:
-        recent = list(iris_buffer)[-5:]
-    if not recent:
-        return jsonify({"error": "no iris data - face not detected"}), 400
-
-    avg_ix = sum(r[0] for r in recent) / len(recent)
-    avg_iy = sum(r[1] for r in recent) / len(recent)
-
-    calibration.add_sample(avg_ix, avg_iy, screen_x, screen_y)
-    return jsonify({"ok": True, "samples": len(calibration.samples_iris)})
-
-
-@app.route("/calibrate_finish", methods=["POST"])
-def calibrate_finish():
-    if len(calibration.samples_iris) < 9:
-        return jsonify({"ok": False, "error": "not enough samples"}), 400
-    calibration.train()
-    calibration.save(CALIBRATION_PATH)
-    kalman.reset()
-    print(f"[CALIBRATION] Trained with {len(calibration.samples_iris)} samples, saved to {CALIBRATION_PATH}")
-    return jsonify({"ok": True})
-
-
-@app.route("/calibrate_reset", methods=["POST"])
-def calibrate_reset():
-    calibration.clear()
-    kalman.reset()
-    return jsonify({"ok": True})
-
-
-@app.route("/gaze")
+@app.route('/gaze', methods=['GET'])
 def get_gaze():
     with gaze_lock:
-        return Response(json.dumps(latest_gaze), mimetype="application/json")
+        return Response(json.dumps(latest_gaze), mimetype='application/json')
 
 
-@app.route("/gaze_history")
+@app.route('/gaze', methods=['POST'])
+def post_gaze():
+    global latest_gaze
+    data = request.get_json(silent=True)
+    if not data:
+        return Response('{"error":"no data"}', status=400, mimetype='application/json')
+
+    entry = {
+        "x": float(data.get("x", 0)),
+        "y": float(data.get("y", 0)),
+        "screen_width": int(data.get("screen_width", 0)),
+        "screen_height": int(data.get("screen_height", 0)),
+        "ts": float(data.get("ts", time.time() * 1000))
+    }
+
+    with gaze_lock:
+        latest_gaze = {
+            "x": entry["x"],
+            "y": entry["y"],
+            "tracking": True,
+            "ts": entry["ts"]
+        }
+        gaze_buffer.append(entry)
+
+    return Response('{"ok":true}', mimetype='application/json')
+
+
+@app.route('/gaze_history')
 def gaze_history():
-    n = request.args.get("n", 100, type=int)
+    n = request.args.get('n', 100, type=int)
     with gaze_lock:
         items = list(gaze_buffer)[-n:]
-    return Response(json.dumps(items), mimetype="application/json")
+    return Response(json.dumps(items), mimetype='application/json')
+
+
+@app.route('/calibration_status', methods=['POST'])
+def calibration_status():
+    data = request.get_json(silent=True)
+    if data:
+        print(f"[CALIBRATION] Accuracy: {data.get('accuracy')}%, Avg error: {data.get('avgErrorPx')}px")
+    return Response('{"ok":true}', mimetype='application/json')
 
 
 if __name__ == "__main__":
-    # Load previous calibration if exists
-    if os.path.exists(CALIBRATION_PATH):
-        if calibration.load(CALIBRATION_PATH):
-            print(f"[OK] Loaded previous calibration ({len(calibration.samples_iris)} samples)")
-        else:
-            print("[WARN] Previous calibration file found but insufficient data")
-
-    # Start camera thread
-    threading.Thread(target=camera_thread, daemon=True).start()
-
-    print()
-    print("  Eye Tracker running on http://localhost:5000")
-    print("  Open browser to calibrate. After calibration, you can close the browser.")
-    print("  GET /gaze returns live eye tracking coordinates.")
-    print()
-
-    app.run(host="0.0.0.0", port=PORT, debug=False)
+    print("Open http://localhost:5000 in your browser")
+    app.run(host='0.0.0.0', port=PORT, debug=False)
