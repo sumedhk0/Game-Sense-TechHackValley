@@ -297,6 +297,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <html>
 <head>
 <title>GameSense Eye Tracker</title>
+<script src="https://cdn.jsdelivr.net/npm/webgazer@2.1.3/dist/webgazer.min.js"></script>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body {
