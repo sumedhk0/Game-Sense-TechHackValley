@@ -71,11 +71,6 @@ def rms_to_motor_intensities(rms_list):
     return [min(254, max(0, int(v * 254))) for v in motor_values]
 
 
-def send_serial(ser, intensities):
-    """Send sync byte + 8 motor intensity bytes over serial."""
-    packet = struct.pack("B" * (NUM_MOTORS+1), SYNC_BYTE, *intensities)
-    ser.write(packet)
-
 
 def output_rms(rms_list):
     formatted = [f"{v:.4f}" for v in rms_list]
@@ -109,12 +104,15 @@ def main():
         )
 
         print("Capturing... Press Ctrl+C to stop.\n")
+        packet = bytearray(NUM_MOTORS + 1)
+        packet[0] = SYNC_BYTE
         while True:
             raw_data = stream.read(chunk, exception_on_overflow=False)
             rms_list = compute_channel_rms(raw_data, num_channels=channels)
             output_rms(rms_list)
             intensities = rms_to_motor_intensities(rms_list)
-            send_serial(ser, intensities)
+            packet[1:] = intensities
+            serial.write(packet)
 
     except KeyboardInterrupt:
         print("\nStopping capture.")
