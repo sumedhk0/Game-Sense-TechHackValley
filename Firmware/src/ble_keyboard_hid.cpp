@@ -1,6 +1,7 @@
 #include "ble_keyboard_hid.h"
 #include "constants.h"
 #include <BleKeyboard.h>
+#include <Arduino.h>
 
 static BleKeyboard bleKbd("GameSense Controller", "GameSense", 100);
 
@@ -9,16 +10,19 @@ static bool aPressed = false;
 static bool sPressed = false;
 static bool dPressed = false;
 
+bool switchOn;
+
 void bleKeyboardInit() {
     bleKbd.begin();
+    pinMode(SWITCH_PIN, INPUT);
+    switchOn = digitalRead(SWITCH_PIN);
 }
 
-bool bleKeyboardIsConnected() {
-    return bleKbd.isConnected();
-}
 
-void bleKeyboardUpdateFromTilt(float pitch, float roll) {
-    if (!bleKbd.isConnected()) {
+
+void bleKeyboardUpdateFromTilt(float pitch, float roll, bool switchOn) {
+    switchOn = digitalRead(SWITCH_PIN);
+    if (!bleKbd.isConnected() || !switchOn) {
         return;
     }
 
