@@ -1,6 +1,15 @@
 import pyaudiowpatch as pyaudio
 import numpy as np
 
+import serial
+import time
+
+BAUD_RATE = 115200
+NUM_MOTORS = 8
+SYNC_BYTE = 0xFF
+PORT = "COM5"
+
+
 
 def _find_loopback(p):
     """Find the WASAPI loopback device matching the default speakers."""
@@ -54,32 +63,29 @@ class AudioCapture:
         self.close()
 
 
-def get_stereo_levels():
-    """One-shot capture (opens and closes stream). Kept for backward compat."""
-    with AudioCapture() as cap:
-        l, r = cap.read_levels()
-    return [l, r]
-
-
 if __name__ == "__main__":
     import time
     from motor_mapping import stereo_to_motors
-
-    MOTOR_LABELS = ["L", "FL", "F", "FR", "R", "BR", "B", "BL"]
-
     with AudioCapture() as cap:
-        print("Monitoring stereo levels + motor vector (Ctrl+C to stop)...")
         try:
+            ser = serial.Serial(PORT, BAUD_RATE, timeout=1, write_timeout=1)
+            print(f"Connected to {PORT} at {BAUD_RATE} baud.")
+            time.sleep(2)
+            ser.reset_input_buffer()
+            ser.reset_output_buffer()
+            
+            print("Sending wave pattern... Press Ctrl+C to stop.")
+            
             while True:
                 left_rms, right_rms = cap.read_levels()
                 motors = stereo_to_motors(left_rms, right_rms)
-
-                bar_l = "█" * int(left_rms * 50)
-                bar_r = "█" * int(right_rms * 50)
-                motor_str = " ".join(f"{lbl}:{v:3d}" for lbl, v in zip(MOTOR_LABELS, motors))
-                print(f"\rL:{left_rms:.3f} {bar_l:<20} R:{right_rms:.3f} {bar_r:<20} | {motor_str}", end="")
-
+                packet = bytearray([SYNC_BYTE]) + bytearray(motors)
+                ser.write(packet)
                 time.sleep(0.03)
+        except serial.SerialException as e:
+            print(f"Error opening up serial port: {e}")
         except KeyboardInterrupt:
-            pass
-    print()
+            print("\nStopping...")
+            if 'ser' in locals() and ser.is_open:
+                ser.write(bytearray([SYNC_BYTE] + [0]*NUM_MOTORS))
+                ser.close()

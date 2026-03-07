@@ -43,5 +43,6 @@ def stereo_to_motors(left_rms: float, right_rms: float) -> list[int]:
     # Motor 5 (back-right) = Motor 3 (front-right)
     # Motor 6 (back)       = Motor 2 (front)
     # Motor 7 (back-left)  = Motor 1 (front-left)
+    
     return [front[0], front[1], front[2], front[3], front[4],
             front[3], front[2], front[1]]
