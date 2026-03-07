@@ -112,7 +112,7 @@ def main():
             output_rms(rms_list)
             intensities = rms_to_motor_intensities(rms_list)
             packet[1:] = intensities
-            serial.write(packet)
+            ser.write(packet)
 
     except KeyboardInterrupt:
         print("\nStopping capture.")
