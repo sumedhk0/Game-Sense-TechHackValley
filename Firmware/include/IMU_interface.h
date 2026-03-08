@@ -14,6 +14,9 @@ public:
     void begin(uint32_t spiFreq);
     void update();
     void setOutput(std::array<float, 9>& imuVals);
+    void calibrate(uint16_t numSamples = 100);
+    float getPitch();
+    float getRoll();
 
     float getAccX();
     float getAccY();
@@ -33,7 +36,8 @@ private:
     int m_MisoPin;
     int m_MosiPin;
     ICM_20948_SPI m_icm;
-    
+    float m_pitchOffset = 0.0f;
+    float m_rollOffset = 0.0f;
 };
 
 #endif 

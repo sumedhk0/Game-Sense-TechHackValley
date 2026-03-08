@@ -11,6 +11,7 @@
 IMU imu(CS_PIN, SCK_PIN, MISO_PIN, MOSI_PIN);
 unsigned long lastPrint = 0;
 unsigned long lastBleUpdate = 0;
+bool prevSwitchState = false;
 
 void setup() {
     WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
@@ -20,8 +21,10 @@ void setup() {
         Serial.read();
     }
     motorsInit();
-    imu.begin(7000000); // Initialize IMU with 7MHz SPI frequency
+    imu.begin(7000000);
+    imu.calibrate();
     bleKeyboardInit();
+    prevSwitchState = digitalRead(SWITCH_PIN);
 }
 
 void loop() {
@@ -37,12 +40,18 @@ void loop() {
         Serial.println();
     }
 
+    // Recalibrate on switch OFF→ON transition
+    bool currentSwitch = digitalRead(SWITCH_PIN);
+    if (currentSwitch && !prevSwitchState) {
+        imu.calibrate();
+    }
+    prevSwitchState = currentSwitch;
+
     // Tilt-to-BLE keyboard update (~50Hz)
     if (millis() - lastBleUpdate > 20) {
         lastBleUpdate = millis();
-        // Accelerometer-only tilt estimate (placeholder until Kalman filter is ready)
-        float pitch = atan2(-imuVals[0], sqrt(imuVals[1]*imuVals[1] + imuVals[2]*imuVals[2])) * 180.0f / M_PI;
-        float roll  = atan2(imuVals[1], imuVals[2]) * 180.0f / M_PI;
+        float pitch = imu.getPitch();
+        float roll  = imu.getRoll();
         bleKeyboardUpdateFromTilt(pitch, roll);
     }
 
