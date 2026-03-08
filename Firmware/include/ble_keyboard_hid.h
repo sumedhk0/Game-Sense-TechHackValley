@@ -11,6 +11,6 @@ bool bleKeyboardIsConnected();
 //   pitch > 0 → forward tilt → W    pitch < 0 → backward tilt → S
 //   roll  < 0 → left tilt    → A    roll  > 0 → right tilt    → D
 // Handles key press/release with hysteresis internally.
-void bleKeyboardUpdateFromTilt(float pitch, float roll, bool switchOn);
+void bleKeyboardUpdateFromTilt(float pitch, float roll);
 
 #endif

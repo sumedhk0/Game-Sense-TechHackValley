@@ -18,7 +18,8 @@ constexpr uint8_t MOSI_PIN = 23;
 constexpr uint8_t SWITCH_PIN = 35;
 
 // Pin assignments: Front, Front-Right, Right, Back-Right, Back, Back-Left, Left, Front-Left
-constexpr std::array<uint8_t, NUM_MOTORS> MOTOR_PINS = {32, 33, 25, 26, 27, 13, 22, 21};
+constexpr std::array<uint8_t, NUM_MOTORS> MOTOR_PINS = {13, 22, 32, 26, 27, 21, 33, 25};
+// CORRECT : CENTER
 
 constexpr uint8_t SYNC_BYTE = 0xFF;
 
