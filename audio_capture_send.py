@@ -116,7 +116,7 @@ def seven_rms_to_motor_intensities(rms_list):
         sl,              # 6: Left
         fl,              # 7: Front-Left
     ]
-    return [min(254, max(0, int(v * 254))) for v in motor_values]
+    return [min(254, max(0, int(v * 254) * 10)+ 40) for v in motor_values]
 
 
 
