@@ -8,6 +8,9 @@ from flask import Flask, request, Response, jsonify
 BUFFER_SIZE = 1000
 PORT = 5000
 
+SERIAL_PORT= 'COM5'
+BAUD_RATE=115200
+
 # Shared state
 gaze_lock = threading.Lock()
 latest_gaze = {"x": 0, "y": 0, "tracking": False, "ts": 0}

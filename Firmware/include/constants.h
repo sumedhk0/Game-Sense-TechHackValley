@@ -24,4 +24,6 @@ constexpr uint8_t SYNC_BYTE = 0xFF;
 constexpr float TILT_DEAD_ZONE    = 15.0f;  // angle to activate key press
 constexpr float TILT_RELEASE_ZONE = 10.0f;  // angle to release key (hysteresis)
 
+constexpr uint8_t MOUSE_SENSITVITY = 50;
+
 #endif
