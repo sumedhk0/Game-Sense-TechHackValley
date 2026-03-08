@@ -1,1 +1,1 @@
-Game Sense.
+GameSense.
