@@ -20,11 +20,16 @@ void bleKeyboardInit() {
 
 
 
-void bleKeyboardUpdateFromTilt(float pitch, float roll, bool switchOn) {
+void bleKeyboardUpdateFromTilt(float pitch, float roll) {
     switchOn = digitalRead(SWITCH_PIN);
     if (!bleKbd.isConnected() || !switchOn) {
+        if (wPressed) { bleKbd.release('w'); wPressed = false; }
+        if (aPressed) { bleKbd.release('a'); aPressed = false; }
+        if (sPressed) { bleKbd.release('s'); sPressed = false; }
+        if (dPressed) { bleKbd.release('d'); dPressed = false; }
         return;
     }
+
 
     // Pitch axis: W (forward) / S (backward)
     if (!wPressed && pitch > TILT_DEAD_ZONE) {

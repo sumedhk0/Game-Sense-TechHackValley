@@ -16,10 +16,10 @@ void setup() {
     WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
     Serial.begin(BAUD_RATE);
     Serial.setTimeout(50);
-    // while (Serial.available()) {
-    //     Serial.read();
-    // }
-    // motorsInit();
+    while (Serial.available()) {
+        Serial.read();
+    }
+    motorsInit();
     imu.begin(7000000); // Initialize IMU with 7MHz SPI frequency
     bleKeyboardInit();
 }
