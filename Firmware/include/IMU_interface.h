@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <array>
 #include "constants.h"
+#include <Arduino.h>
 #include "ICM_20948.h"
 
 class IMU {
